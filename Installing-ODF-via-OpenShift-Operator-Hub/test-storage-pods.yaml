@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-rbd-pod
+  namespace: default
+spec:
+  containers:
+  - name: test-container
+    image: busybox
+    command: ["/bin/sh"]
+    args: ["-c", "while true; do echo Thu Oct  8 06:00:43 UTC 2026 >> /mnt/test-file; sleep 30; done"]
+    volumeMounts:
+    - name: test-volume
+      mountPath: /mnt
+  volumes:
+  - name: test-volume
+    persistentVolumeClaim:
+      claimName: test-rbd-pvc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-cephfs-pod
+  namespace: default
+spec:
+  containers:
+  - name: test-container
+    image: busybox
+    command: ["/bin/sh"]
+    args: ["-c", "while true; do echo Thu Oct  8 06:00:43 UTC 2026 >> /mnt/test-file; sleep 30; done"]
+    volumeMounts:
+    - name: test-volume
+      mountPath: /mnt
+  volumes:
+  - name: test-volume
+    persistentVolumeClaim:
+      claimName: test-cephfs-pvc

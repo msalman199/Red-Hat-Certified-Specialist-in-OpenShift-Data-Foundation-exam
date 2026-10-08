@@ -1,0 +1,37 @@
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  arbiter: {}
+  encryption:
+    kms: {}
+  externalStorage: {}
+  managedResources:
+    cephBlockPools: {}
+    cephConfig: {}
+    cephDashboard: {}
+    cephFilesystems: {}
+    cephObjectStoreUsers: {}
+    cephObjectStores: {}
+  mirroring: {}
+  nodeTopologies: {}
+  storageDeviceSets:
+  - count: 1
+    dataPVCTemplate:
+      metadata: {}
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 100Gi
+        storageClassName: gp3-csi
+        volumeMode: Block
+      status: {}
+    name: ocs-deviceset-gp3-csi
+    placement: {}
+    portable: true
+    replica: 3
+    resources: {}

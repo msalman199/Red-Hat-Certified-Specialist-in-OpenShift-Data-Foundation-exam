@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-perf-test
+  namespace: default
+spec:
+  containers:
+  - name: fio-test
+    image: quay.io/openshift/origin-tests:latest
+    command: ["/bin/bash"]
+    args: ["-c", "fio --name=test --ioengine=libaio --rw=randwrite --bs=4k --size=1G --numjobs=1 --runtime=60 --group_reporting --filename=/mnt/testfile"]
+    volumeMounts:
+    - name: test-volume
+      mountPath: /mnt
+  volumes:
+  - name: test-volume
+    persistentVolumeClaim:
+      claimName: test-rbd-pvc
+  restartPolicy: Never
