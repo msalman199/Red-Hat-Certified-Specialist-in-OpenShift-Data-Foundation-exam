@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: data-processor
+  namespace: storage-lab
+spec:
+  serviceName: "data-processor"
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-processor
+  template:
+    metadata:
+      labels:
+        app: data-processor
+    spec:
+      containers:
+      - name: data-processor
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          echo "Starting data processor $(hostname)" > /data/startup.log
+          date >> /data/startup.log
+          while true; do
+            echo "Processing data at $(date)" >> /data/processing.log
+            sleep 30
+          done
+        volumeMounts:
+        - name: data-storage
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: ocs-storagecluster-ceph-rbd
+      resources:
+        requests:
+          storage: 5Gi
