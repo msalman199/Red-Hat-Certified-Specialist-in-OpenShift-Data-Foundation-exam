@@ -1,0 +1,27 @@
+apiVersion: ceph.rook.io/v1
+kind: CephNFS
+metadata:
+  name: ceph-nfs
+  namespace: openshift-storage
+spec:
+  rados:
+    pool: ocs-storagecluster-cephfilesystem-metadata
+    namespace: nfs-ns
+  server:
+    active: 2
+    annotations:
+      rook: nfs
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: cluster.ocs.openshift.io/openshift-storage
+              operator: Exists
+    resources:
+      limits:
+        cpu: 500m
+        memory: 1Gi
+      requests:
+        cpu: 200m
+        memory: 512Mi
