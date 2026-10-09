@@ -1,0 +1,48 @@
+---
+- name: ODF Storage Health Check
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+
+  tasks:
+    - name: Check ODF namespace status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ odf_namespace }}"
+      register: odf_namespace_status
+
+    - name: Display namespace status
+      debug:
+        msg: "ODF Namespace Status: {{ odf_namespace_status.resources[0].status.phase }}"
+      when: odf_namespace_status.resources | length > 0
+
+    - name: Get all storage classes
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: storage_classes
+
+    - name: Report ODF-related storage classes
+      debug:
+        msg: "Found storage class: {{ item.metadata.name }} (provisioner: {{ item.provisioner }})"
+      loop: "{{ storage_classes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: "'ceph' in item.provisioner or 'ocs' in item.metadata.name"
+
+    - name: Get Ceph cluster status
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_clusters
+
+    - name: Display Ceph cluster health
+      debug:
+        msg: "Ceph Cluster {{ item.metadata.name }} phase: {{ item.status.phase | default('Unknown') }}"
+      loop: "{{ ceph_clusters.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: ceph_clusters.resources | length > 0

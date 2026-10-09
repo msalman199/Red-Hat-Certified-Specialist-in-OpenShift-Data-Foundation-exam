@@ -1,0 +1,312 @@
+Lab 19: Troubleshooting ODF Using Ansible
+Objectives
+By the end of this lab, students will be able to:
+
+Implement Ansible automation for troubleshooting OpenShift Data Foundation (ODF) storage issues
+Utilize Ansible facts and Kubernetes/OpenShift collections to verify ODF system state
+Develop a playbook that detects common ODF problems (failed PVCs, unhealthy Ceph pods)
+Generate structured troubleshooting reports from playbook run data
+Configure a validation playbook that checks ODF state against defined rules
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of OpenShift Container Platform concepts
+Familiarity with OpenShift Data Foundation (ODF) components (CephCluster, OSD pods, storage classes)
+Knowledge of Ansible fundamentals including playbooks, tasks, and modules
+Experience with YAML and Jinja2 template syntax
+Understanding of Kubernetes/OpenShift CLI commands
+Basic Linux command line skills
+Required tools must be installed on the Ansible control node:
+
+python3 -m pip install --user ansible kubernetes
+ansible-galaxy collection install kubernetes.core
+ansible-galaxy collection install community.general
+Lab Environment
+Ready-to-Use Cloud Machines: Al Nafi provides pre-configured Linux-based cloud machines with all necessary tools installed. Simply click Start Lab to begin - no need to build your own VM or install software.
+
+Your lab environment includes:
+
+OpenShift cluster with ODF installed
+Ansible control node with kubernetes.core and community.general collections
+Pre-configured authentication and access (a valid oc login session or API token)
+Sample storage workloads for testing
+This lab uses the kubernetes.core.k8s_info module to query cluster state (a read-only, safe operation) rather than modules that make cluster changes, so it is safe to run repeatedly against a shared cluster.
+
+Task 1: Build the Ansible Project and Authenticate to the Cluster
+Subtask 1.1: Create the Project Structure
+mkdir -p ~/odf-troubleshooting-lab/{playbooks,inventory,templates}
+cd ~/odf-troubleshooting-lab
+Subtask 1.2: Configure Inventory and Connection Variables
+Create the inventory file. This lab authenticates using the kubeconfig already active on the control node (from oc login), which is simpler and more reliable than passing raw tokens through Ansible variables.
+
+cat > inventory/hosts.yml << 'EOF'
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars:
+    odf_namespace: "openshift-storage"
+EOF
+Verify that your current shell session is already authenticated to the cluster, since the playbooks in this lab rely on the active kubeconfig context rather than re-authenticating in Ansible:
+
+oc whoami
+oc get project openshift-storage
+Deliverable: Running oc whoami returns your username, and oc get project openshift-storage returns the project without an error. This confirms the kubeconfig used by kubernetes.core modules is valid.
+
+Subtask 1.3: Create a Basic Storage Health Check Playbook
+This playbook uses kubernetes.core.k8s_info, which reads its connection details (server, token, certificate) from the active kubeconfig by default when no host/api_key parameters are given. This avoids duplicating authentication logic in every task.
+
+cat > playbooks/storage-health-check.yml << 'EOF'
+---
+- name: ODF Storage Health Check
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+
+  tasks:
+    - name: Check ODF namespace status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ odf_namespace }}"
+      register: odf_namespace_status
+
+    - name: Display namespace status
+      debug:
+        msg: "ODF Namespace Status: {{ odf_namespace_status.resources[0].status.phase }}"
+      when: odf_namespace_status.resources | length > 0
+
+    - name: Get all storage classes
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: storage_classes
+
+    - name: Report ODF-related storage classes
+      debug:
+        msg: "Found storage class: {{ item.metadata.name }} (provisioner: {{ item.provisioner }})"
+      loop: "{{ storage_classes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: "'ceph' in item.provisioner or 'ocs' in item.metadata.name"
+
+    - name: Get Ceph cluster status
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_clusters
+
+    - name: Display Ceph cluster health
+      debug:
+        msg: "Ceph Cluster {{ item.metadata.name }} phase: {{ item.status.phase | default('Unknown') }}"
+      loop: "{{ ceph_clusters.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: ceph_clusters.resources | length > 0
+EOF
+Run the playbook:
+
+ansible-playbook -i inventory/hosts.yml playbooks/storage-health-check.yml
+Deliverable: The playbook completes with failed=0. The debug output shows the ODF namespace phase as Active, lists at least one storage class containing ceph in its provisioner (for example openshift-storage.rbd.csi.ceph.com), and reports a CephCluster phase (typically Ready on a healthy cluster). If the CephCluster task returns zero resources, this is expected on a minimal or non-ODF cluster and should be noted in your results rather than treated as a failure.
+
+Task 2: Detect Common Storage Issues and Generate a Report
+Subtask 2.1: Create the Issue-Detection Playbook
+This playbook checks for two common ODF problems: PVCs stuck in Pending and Ceph OSD pods not in the Running phase.
+
+cat > playbooks/storage-troubleshooting.yml << 'EOF'
+---
+- name: Detect Common ODF Storage Issues
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+
+  tasks:
+    - name: Get all PVCs across the cluster
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+      register: all_pvcs
+
+    - name: Identify pending PVCs
+      set_fact:
+        failed_pvcs: "{{ all_pvcs.resources | selectattr('status.phase', 'equalto', 'Pending') | list }}"
+
+    - name: Report pending PVCs
+      debug:
+        msg: "Pending PVC: {{ item.metadata.name }} in namespace {{ item.metadata.namespace }}"
+      loop: "{{ failed_pvcs }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: failed_pvcs | length > 0
+
+    - name: Report when no pending PVCs are found
+      debug:
+        msg: "No pending PVCs detected."
+      when: failed_pvcs | length == 0
+
+    - name: Get Ceph OSD pods
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+        label_selectors:
+          - "app=rook-ceph-osd"
+      register: ceph_osd_pods
+
+    - name: Identify unhealthy OSD pods
+      set_fact:
+        unhealthy_osds: "{{ ceph_osd_pods.resources | rejectattr('status.phase', 'equalto', 'Running') | list }}"
+
+    - name: Report unhealthy OSD pods
+      debug:
+        msg: "Unhealthy OSD Pod: {{ item.metadata.name }} - Status: {{ item.status.phase }}"
+      loop: "{{ unhealthy_osds }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: unhealthy_osds | length > 0
+
+    - name: Report when all OSD pods are healthy
+      debug:
+        msg: "All {{ ceph_osd_pods.resources | length }} Ceph OSD pods are Running."
+      when: unhealthy_osds | length == 0
+
+    - name: Generate troubleshooting report
+      template:
+        src: templates/troubleshooting-report.j2
+        dest: "/tmp/odf-troubleshooting-report-{{ ansible_date_time.epoch }}.txt"
+
+    - name: Show report location
+      debug:
+        msg: "Report written to /tmp/odf-troubleshooting-report-{{ ansible_date_time.epoch }}.txt"
+EOF
+Subtask 2.2: Create the Report Template
+cat > templates/troubleshooting-report.j2 << 'EOF'
+ODF Storage Troubleshooting Report
+Generated: {{ ansible_date_time.iso8601 }}
+=====================================
+
+Summary:
+- Pending PVCs: {{ failed_pvcs | length }}
+- Unhealthy OSD Pods: {{ unhealthy_osds | length }}
+
+{% if failed_pvcs | length > 0 %}
+Pending PVCs:
+{% for pvc in failed_pvcs %}
+- Name: {{ pvc.metadata.name }}
+  Namespace: {{ pvc.metadata.namespace }}
+  Storage Class: {{ pvc.spec.storageClassName | default('N/A') }}
+{% endfor %}
+{% endif %}
+
+{% if unhealthy_osds | length > 0 %}
+Unhealthy OSD Pods:
+{% for osd in unhealthy_osds %}
+- Name: {{ osd.metadata.name }}
+  Status: {{ osd.status.phase }}
+  Node: {{ osd.spec.nodeName | default('N/A') }}
+{% endfor %}
+{% endif %}
+
+Recommendations:
+{% if failed_pvcs | length > 0 %}
+- Check storage class availability and configuration
+- Verify sufficient storage capacity with `oc describe pvc <name> -n <namespace>`
+{% endif %}
+{% if unhealthy_osds | length > 0 %}
+- Check node health and disk availability
+- Review OSD logs with `oc logs <pod-name> -n openshift-storage`
+{% endif %}
+{% if failed_pvcs | length == 0 and unhealthy_osds | length == 0 %}
+- No action required; storage subsystem appears healthy
+{% endif %}
+EOF
+Subtask 2.3: Run the Playbook and Inspect the Report
+ansible-playbook -i inventory/hosts.yml playbooks/storage-troubleshooting.yml
+cat /tmp/odf-troubleshooting-report-*.txt
+Deliverable: A file named /tmp/odf-troubleshooting-report-<epoch>.txt exists and contains a "Summary" section with numeric counts for pending PVCs and unhealthy OSD pods, matching the counts shown in the playbook's debug output during the run. On a healthy cluster with no test workloads, both counts should be 0 and the recommendations section should state no action is required.
+
+Task 3: Verify ODF System State Against Validation Rules
+Subtask 3.1: Create a State Verification Playbook Using Facts
+This playbook gathers ODF-related facts with set_fact and validates them against fixed rules (minimum storage nodes, expected storage classes present).
+
+cat > playbooks/verify-odf-state.yml << 'EOF'
+---
+- name: Verify ODF System State
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+    validation_rules:
+      min_storage_nodes: 3
+
+  tasks:
+    - name: Gather storage class facts
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: all_storage_classes
+
+    - name: Set ODF storage class fact
+      set_fact:
+        odf_storage_classes: "{{ all_storage_classes.resources | selectattr('provisioner', 'search', 'ceph') | list }}"
+
+    - name: Gather Ceph cluster facts
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_clusters
+
+    - name: Set Ceph cluster health fact
+      set_fact:
+        ceph_cluster_healthy: "{{ ceph_clusters.resources | selectattr('status.phase', 'equalto', 'Ready') | list | length > 0 }}"
+
+    - name: Gather node facts
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: cluster_nodes
+
+    - name: Set storage node fact
+      set_fact:
+        storage_nodes: "{{ cluster_nodes.resources | selectattr('metadata.labels', 'defined') | selectattr('metadata.labels', 'contains', 'cluster.ocs.openshift.io/openshift-storage') | list }}"
+
+    - name: Validate minimum storage node count
+      set_fact:
+        storage_nodes_valid: "{{ (storage_nodes | length) >= validation_rules.min_storage_nodes }}"
+
+    - name: Display system state summary
+      debug:
+        msg:
+          - "ODF storage classes found: {{ odf_storage_classes | length }}"
+          - "Ceph cluster healthy: {{ ceph_cluster_healthy }}"
+          - "Storage nodes found: {{ storage_nodes | length }} (minimum required: {{ validation_rules.min_storage_nodes }})"
+          - "Storage node requirement met: {{ storage_nodes_valid }}"
+
+    - name: Fail the play if validation rules are not met
+      fail:
+        msg: "ODF validation failed: insufficient storage nodes or unhealthy Ceph cluster."
+      when: not storage_nodes_valid or not ceph_cluster_healthy
+      ignore_errors: yes
+EOF
+Note: selectattr('metadata.labels', 'contains', ...) treats the labels dictionary as a collection of its keys, which is valid in Jinja2/Ansible for checking label presence.
+
+Subtask 3.2: Run the Validation Playbook
+ansible-playbook -i inventory/hosts.yml playbooks/verify-odf-state.yml
+Deliverable: The debug task prints a four-line summary showing counts for storage classes and storage nodes, the Ceph health boolean, and whether the node requirement was met. If validation rules are not satisfied (for example, fewer than three labeled storage nodes in a compact or single-node test cluster), the final task reports a failure message describing exactly which rule was not met, but the play continues (ignore_errors: yes) so the full report is still visible. Record whether your cluster passed or failed each rule.
+
+Expected Outcomes
+A working set of three Ansible playbooks that check ODF namespace/storage class/Ceph cluster health, detect pending PVCs and unhealthy OSD pods, and validate cluster state against fixed rules
+A generated troubleshooting report file in /tmp containing accurate counts pulled directly from live playbook data
+Practical experience using kubernetes.core.k8s_info, set_fact, selectattr/rejectattr filters, and Jinja2 templates to build ODF diagnostic tooling
+Troubleshooting
+Issue 1: Tasks fail with an authentication or "Unable to connect" error. Diagnostic hint: Run oc whoami and oc get ns directly in the same shell used to launch ansible-playbook. If those fail, your kubeconfig session has expired and the kubernetes.core modules (which rely on it by default) will fail identically.
+
+Issue 2: ceph_clusters.resources or ceph_osd_pods.resources is always empty. Diagnostic hint: Confirm the CephCluster CRD and labels actually exist on your cluster with oc get cephcluster -n openshift-storage and oc get pods -n openshift-storage -l app=rook-ceph-osd. A minimal test cluster without full ODF deployed will legitimately return zero resources; this is not a playbook bug.
+
+Conclusion
+In this lab, students built a small but complete Ansible automation suite for troubleshooting OpenShift Data Foundation storage, using the kubernetes.core collection to query namespace, storage class, PVC, pod, and CephCluster state directly from a live OpenShift cluster. Students practiced turning raw Kubernetes API data into actionable diagnostics by using set_fact, selectattr, and rejectattr to isolate pending PVCs and unhealthy OSD pods, and by rendering that data into a readable Jinja2 report. The final validation playbook demonstrated how fixed operational rules, such as a minimum storage node count, can be checked automatically and reported clearly. These same patterns, gathering facts, filtering for problem states, and generating structured reports, apply directly to real ODF production environments, and students should next explore extending these playbooks with scheduled execution (via cron or an Ansible AWX/Tower job template) and integrating alerts with existing monitoring pipelines such as Prometheus Alertmanager

@@ -1,0 +1,58 @@
+---
+- name: Verify ODF System State
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+    validation_rules:
+      min_storage_nodes: 3
+
+  tasks:
+    - name: Gather storage class facts
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: all_storage_classes
+
+    - name: Set ODF storage class fact
+      set_fact:
+        odf_storage_classes: "{{ all_storage_classes.resources | selectattr('provisioner', 'search', 'ceph') | list }}"
+
+    - name: Gather Ceph cluster facts
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_clusters
+
+    - name: Set Ceph cluster health fact
+      set_fact:
+        ceph_cluster_healthy: "{{ ceph_clusters.resources | selectattr('status.phase', 'equalto', 'Ready') | list | length > 0 }}"
+
+    - name: Gather node facts
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: cluster_nodes
+
+    - name: Set storage node fact
+      set_fact:
+        storage_nodes: "{{ cluster_nodes.resources | selectattr('metadata.labels', 'defined') | selectattr('metadata.labels', 'contains', 'cluster.ocs.openshift.io/openshift-storage') | list }}"
+
+    - name: Validate minimum storage node count
+      set_fact:
+        storage_nodes_valid: "{{ (storage_nodes | length) >= validation_rules.min_storage_nodes }}"
+
+    - name: Display system state summary
+      debug:
+        msg:
+          - "ODF storage classes found: {{ odf_storage_classes | length }}"
+          - "Ceph cluster healthy: {{ ceph_cluster_healthy }}"
+          - "Storage nodes found: {{ storage_nodes | length }} (minimum required: {{ validation_rules.min_storage_nodes }})"
+          - "Storage node requirement met: {{ storage_nodes_valid }}"
+
+    - name: Fail the play if validation rules are not met
+      fail:
+        msg: "ODF validation failed: insufficient storage nodes or unhealthy Ceph cluster."
+      when: not storage_nodes_valid or not ceph_cluster_healthy
+      ignore_errors: yes

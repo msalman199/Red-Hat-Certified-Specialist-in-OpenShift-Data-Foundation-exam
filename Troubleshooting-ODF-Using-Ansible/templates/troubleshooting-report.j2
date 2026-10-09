@@ -1,0 +1,38 @@
+ODF Storage Troubleshooting Report
+Generated: {{ ansible_date_time.iso8601 }}
+=====================================
+
+Summary:
+- Pending PVCs: {{ failed_pvcs | length }}
+- Unhealthy OSD Pods: {{ unhealthy_osds | length }}
+
+{% if failed_pvcs | length > 0 %}
+Pending PVCs:
+{% for pvc in failed_pvcs %}
+- Name: {{ pvc.metadata.name }}
+  Namespace: {{ pvc.metadata.namespace }}
+  Storage Class: {{ pvc.spec.storageClassName | default('N/A') }}
+{% endfor %}
+{% endif %}
+
+{% if unhealthy_osds | length > 0 %}
+Unhealthy OSD Pods:
+{% for osd in unhealthy_osds %}
+- Name: {{ osd.metadata.name }}
+  Status: {{ osd.status.phase }}
+  Node: {{ osd.spec.nodeName | default('N/A') }}
+{% endfor %}
+{% endif %}
+
+Recommendations:
+{% if failed_pvcs | length > 0 %}
+- Check storage class availability and configuration
+- Verify sufficient storage capacity with `oc describe pvc <name> -n <namespace>`
+{% endif %}
+{% if unhealthy_osds | length > 0 %}
+- Check node health and disk availability
+- Review OSD logs with `oc logs <pod-name> -n openshift-storage`
+{% endif %}
+{% if failed_pvcs | length == 0 and unhealthy_osds | length == 0 %}
+- No action required; storage subsystem appears healthy
+{% endif %}

@@ -1,0 +1,65 @@
+---
+- name: Detect Common ODF Storage Issues
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    odf_namespace: "openshift-storage"
+
+  tasks:
+    - name: Get all PVCs across the cluster
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+      register: all_pvcs
+
+    - name: Identify pending PVCs
+      set_fact:
+        failed_pvcs: "{{ all_pvcs.resources | selectattr('status.phase', 'equalto', 'Pending') | list }}"
+
+    - name: Report pending PVCs
+      debug:
+        msg: "Pending PVC: {{ item.metadata.name }} in namespace {{ item.metadata.namespace }}"
+      loop: "{{ failed_pvcs }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: failed_pvcs | length > 0
+
+    - name: Report when no pending PVCs are found
+      debug:
+        msg: "No pending PVCs detected."
+      when: failed_pvcs | length == 0
+
+    - name: Get Ceph OSD pods
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+        label_selectors:
+          - "app=rook-ceph-osd"
+      register: ceph_osd_pods
+
+    - name: Identify unhealthy OSD pods
+      set_fact:
+        unhealthy_osds: "{{ ceph_osd_pods.resources | rejectattr('status.phase', 'equalto', 'Running') | list }}"
+
+    - name: Report unhealthy OSD pods
+      debug:
+        msg: "Unhealthy OSD Pod: {{ item.metadata.name }} - Status: {{ item.status.phase }}"
+      loop: "{{ unhealthy_osds }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: unhealthy_osds | length > 0
+
+    - name: Report when all OSD pods are healthy
+      debug:
+        msg: "All {{ ceph_osd_pods.resources | length }} Ceph OSD pods are Running."
+      when: unhealthy_osds | length == 0
+
+    - name: Generate troubleshooting report
+      template:
+        src: templates/troubleshooting-report.j2
+        dest: "/tmp/odf-troubleshooting-report-{{ ansible_date_time.epoch }}.txt"
+
+    - name: Show report location
+      debug:
+        msg: "Report written to /tmp/odf-troubleshooting-report-{{ ansible_date_time.epoch }}.txt"
