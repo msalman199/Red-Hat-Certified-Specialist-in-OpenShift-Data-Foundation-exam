@@ -1,0 +1,24 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: odf-pvc-deletion-alert
+  namespace: openshift-storage
+  labels:
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: odf.storage.access
+    rules:
+    - alert: RapidPVCCountDrop
+      expr: >-
+        (count by (namespace) (kube_persistentvolumeclaim_info) offset 5m)
+        -
+        (count by (namespace) (kube_persistentvolumeclaim_info))
+        > 2
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Rapid drop in PVC count in namespace {{ $labels.namespace }}"
+        description: "More than 2 PVCs disappeared from namespace {{ $labels.namespace }} in the last 5 minutes, which may indicate unauthorized or bulk deletion."

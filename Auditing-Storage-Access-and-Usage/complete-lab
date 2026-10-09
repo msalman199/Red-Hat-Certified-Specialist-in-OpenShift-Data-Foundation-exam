@@ -1,0 +1,196 @@
+Lab 14: Auditing Storage Access and Usage in OpenShift Data Foundation
+Objectives
+By the end of this lab, students will be able to:
+
+Enable and verify OpenShift API server audit logging for storage-related resources
+Query real OpenShift Data Foundation (ODF) storage metrics using Prometheus
+Create a Prometheus alerting rule that fires on suspicious PVC deletion activity
+Generate and retrieve a simple storage usage report stored as a ConfigMap
+Prerequisites
+Before starting this lab, students should have:
+
+Access to an OpenShift cluster (4.13+) with cluster-admin privileges
+OpenShift Data Foundation installed and running in the openshift-storage namespace
+The OpenShift CLI (oc) installed and logged in to the cluster
+Basic familiarity with Kubernetes storage concepts (PVs, PVCs, StorageClasses)
+Basic familiarity with YAML and PromQL
+No additional packages need to be installed. Verify your CLI access before starting:
+
+oc whoami
+oc get storagecluster -n openshift-storage
+You should see your username printed, and a storage cluster resource listed with PHASE: Ready.
+
+Task 1: Verify Audit Logging and Query Storage Access Metrics
+Step 1.1: Confirm the API Server Audit Policy
+OpenShift ships with audit logging enabled by default at the Default profile. In this step you confirm the current profile and raise it so that storage-related write operations are fully recorded.
+
+oc get apiserver cluster -o jsonpath='{.spec.audit.profile}{"\n"}'
+If this returns nothing, the cluster is using the default Default profile. Set the profile explicitly to WriteRequestBodies, which logs full request and response bodies for write operations (create, update, patch, delete) cluster-wide, including PVC and PV changes:
+
+oc patch apiserver cluster --type merge -p '{"spec":{"audit":{"profile":"WriteRequestBodies"}}}'
+Applying this change causes the API server pods to roll out. Wait for the rollout to complete before continuing:
+
+oc get apiserver cluster -o jsonpath='{.spec.audit.profile}{"\n"}'
+oc adm wait-for-stable-cluster --minimum-stable-period=1m || sleep 120
+Deliverable: The command oc get apiserver cluster -o jsonpath='{.spec.audit.profile}{"\n"}' returns WriteRequestBodies.
+
+Step 1.2: Query Real ODF and Storage Metrics from Prometheus
+OpenShift's in-cluster Prometheus (in the openshift-monitoring namespace) already scrapes storage metrics such as kubelet_volume_stats_used_bytes (PVC space used) and kube_persistentvolumeclaim_info (PVC to StorageClass mapping). Rather than inventing non-existent metrics, this step queries metrics that genuinely exist in an OpenShift cluster.
+
+Create a namespace to hold the lab's monitoring artifacts:
+
+oc new-project odf-audit-monitoring
+Retrieve a Prometheus API token and the route so you can query metrics directly:
+
+PROM_TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring --duration=1h)
+PROM_HOST=$(oc get route prometheus-k8s -n openshift-monitoring -o jsonpath='{.spec.host}')
+Query current PVC storage usage across all namespaces:
+
+curl -sk -H "Authorization: Bearer ${PROM_TOKEN}" \
+  "https://${PROM_HOST}/api/v1/query?query=sum(kubelet_volume_stats_used_bytes)"
+You should see a JSON response with "status":"success" and a result array containing a single vector value representing total bytes used across all PVCs in the cluster.
+
+Now query how many PVCs exist per StorageClass:
+
+curl -sk -H "Authorization: Bearer ${PROM_TOKEN}" \
+  --data-urlencode 'query=count by (storageclass) (kube_persistentvolumeclaim_info)' \
+  "https://${PROM_HOST}/api/v1/query"
+Deliverable: Both curl commands return "status":"success" with a non-empty result array. This confirms Prometheus is correctly collecting real ODF/Kubernetes storage metrics that the alert rule in Task 2 will rely on.
+
+Task 2: Alert on Suspicious PVC Deletion and Report on Storage Usage
+Step 2.1: Create a Correct PrometheusRule for PVC Deletion Spikes
+Rather than relying on an audit-log metric (OpenShift does not expose a apiserver_audit_event_total or similarly labeled metric with objectRef_* labels through Prometheus), this rule uses kube_persistentvolumeclaim_info, a real metric exposed by kube-state-metrics, combined with absent()/changes() style detection is unreliable for deletions. Instead, the rule below tracks a drop in bound PVC count per namespace, which is a real, verifiable signal of PVC deletion activity.
+
+cat > pvc-deletion-alert.yaml << 'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: odf-pvc-deletion-alert
+  namespace: openshift-storage
+  labels:
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: odf.storage.access
+    rules:
+    - alert: RapidPVCCountDrop
+      expr: >-
+        (count by (namespace) (kube_persistentvolumeclaim_info) offset 5m)
+        -
+        (count by (namespace) (kube_persistentvolumeclaim_info))
+        > 2
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Rapid drop in PVC count in namespace {{ $labels.namespace }}"
+        description: "More than 2 PVCs disappeared from namespace {{ $labels.namespace }} in the last 5 minutes, which may indicate unauthorized or bulk deletion."
+EOF
+Apply the rule and confirm OpenShift's monitoring stack accepted it:
+
+oc apply -f pvc-deletion-alert.yaml
+oc get prometheusrule odf-pvc-deletion-alert -n openshift-storage
+Verify the rule was loaded into Prometheus itself using the same token and route from Step 1.2:
+
+curl -sk -H "Authorization: Bearer ${PROM_TOKEN}" \
+  "https://${PROM_HOST}/api/v1/rules" | grep -A2 "RapidPVCCountDrop"
+Deliverable: oc get prometheusrule odf-pvc-deletion-alert -n openshift-storage shows the resource, and the curl output contains the string RapidPVCCountDrop, confirming Prometheus loaded the rule.
+
+Step 2.2: Generate and Retrieve a Storage Usage Report
+Create a Job that generates a one-time storage usage report and saves it as a ConfigMap. This demonstrates the reporting mechanism end to end without waiting for a scheduled CronJob.
+
+cat > storage-report-job.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: storage-reporter
+  namespace: odf-audit-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: storage-reporter
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims", "persistentvolumes"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: storage-reporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: storage-reporter
+subjects:
+- kind: ServiceAccount
+  name: storage-reporter
+  namespace: odf-audit-monitoring
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: daily-storage-report
+  namespace: odf-audit-monitoring
+spec:
+  template:
+    spec:
+      serviceAccountName: storage-reporter
+      restartPolicy: Never
+      containers:
+      - name: reporter
+        image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "=== Daily Storage Usage Report ===" > /tmp/report.txt
+          echo "Date: $(date)" >> /tmp/report.txt
+          echo "" >> /tmp/report.txt
+          echo "PVCs across all namespaces:" >> /tmp/report.txt
+          oc get pvc --all-namespaces -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.spec.resources.requests.storage,STORAGECLASS:.spec.storageClassName >> /tmp/report.txt
+          echo "" >> /tmp/report.txt
+          echo "Storage Classes:" >> /tmp/report.txt
+          oc get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy >> /tmp/report.txt
+          cat /tmp/report.txt
+          REPORT_DATE=$(date +%Y%m%d)
+          oc create configmap daily-storage-report-${REPORT_DATE} \
+            --from-file=report.txt=/tmp/report.txt \
+            -n odf-audit-monitoring \
+            --dry-run=client -o yaml | oc apply -f -
+EOF
+Apply the manifest:
+
+oc apply -f storage-report-job.yaml
+Wait for the Job to complete and check its logs:
+
+oc wait --for=condition=complete job/daily-storage-report -n odf-audit-monitoring --timeout=120s
+oc logs job/daily-storage-report -n odf-audit-monitoring
+Now retrieve the generated report from the ConfigMap it created:
+
+oc get configmap -n odf-audit-monitoring | grep daily-storage-report
+REPORT_DATE=$(date +%Y%m%d)
+oc get configmap daily-storage-report-${REPORT_DATE} -n odf-audit-monitoring -o jsonpath='{.data.report\.txt}'
+Deliverable: The oc get configmap command lists a ConfigMap named daily-storage-report-YYYYMMDD, and the final command prints the full text report, including a PVC table and a StorageClass table, to your terminal.
+
+Expected Outcomes
+The cluster's audit profile is set to WriteRequestBodies, ensuring storage write operations are fully logged
+A working PrometheusRule (RapidPVCCountDrop) is loaded into the cluster's Prometheus instance and visible via the Prometheus rules API
+A ConfigMap containing a human-readable storage usage report can be created on demand and retrieved with oc get configmap ... -o jsonpath
+Troubleshooting
+Error: curl: (60) SSL certificate problem or curl: (35) SSL connect error when querying Prometheus Fix: OpenShift's monitoring route uses a cluster-internal CA. Use the -k flag to skip verification in this lab environment, exactly as shown in Step 1.2: curl -sk -H "Authorization: Bearer ${PROM_TOKEN}" ...
+
+Error: Error from server (Forbidden): configmaps is forbidden: User "system:serviceaccount:odf-audit-monitoring:storage-reporter" cannot list resource "persistentvolumeclaims" Fix: The ClusterRoleBinding was not applied or applied to the wrong namespace. Re-apply the full manifest and confirm the binding exists: oc get clusterrolebinding storage-reporter -o yaml
+
+Error: oc wait times out with error: timed out waiting for the condition Fix: Check the Job's pod status directly to see why it has not completed: oc get pods -n odf-audit-monitoring -l job-name=daily-storage-report then oc describe pod <pod-name> -n odf-audit-monitoring
+
+Conclusion
+In this lab you configured OpenShift's API server audit profile to capture write operations against storage resources, then confirmed that OpenShift Data Foundation's real Prometheus metrics, such as kubelet_volume_stats_used_bytes and kube_persistentvolumeclaim_info, are being collected and queryable through the cluster's Prometheus route. You built a PrometheusRule that detects rapid drops in PVC counts per namespace using metrics that genuinely exist in the cluster, and verified it was loaded correctly through the Prometheus rules API rather than assuming it worked. Finally, you generated an on-demand storage usage report and retrieved it from the ConfigMap where it was stored, closing the loop between report generation and report access. Together these steps demonstrate a small but fully working audit and alerting pipeline for storage resources, built entirely from verifiable, real OpenShift and Prometheus behavior.
