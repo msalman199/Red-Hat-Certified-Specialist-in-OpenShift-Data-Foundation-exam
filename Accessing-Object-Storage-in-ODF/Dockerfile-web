@@ -1,0 +1,11 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN pip install flask boto3
+
+COPY web-app.py .
+
+EXPOSE 8080
+
+CMD ["python", "web-app.py"]

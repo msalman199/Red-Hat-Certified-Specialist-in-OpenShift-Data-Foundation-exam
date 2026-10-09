@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: object-storage-lab
+  name: obc-user
+rules:
+- apiGroups: ["objectbucket.io"]
+  resources: ["objectbucketclaims"]
+  verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: obc-user-binding
+  namespace: object-storage-lab
+subjects:
+- kind: User
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: obc-user
+  apiGroup: rbac.authorization.k8s.io

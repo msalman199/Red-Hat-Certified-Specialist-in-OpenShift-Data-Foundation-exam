@@ -1,0 +1,18 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: s3-app
+  namespace: object-storage-lab
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      from:
+        kind: DockerImage
+        name: python:3.9-slim
+  output:
+    to:
+      kind: ImageStreamTag
+      name: s3-app:latest

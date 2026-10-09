@@ -1,0 +1,14 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: s3-object-storage
+  namespace: openshift-storage
+spec:
+  to:
+    kind: Service
+    name: s3
+  port:
+    targetPort: s3
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

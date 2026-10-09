@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-web-app
+  namespace: object-storage-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s3-web-app
+  template:
+    metadata:
+      labels:
+        app: s3-web-app
+    spec:
+      containers:
+      - name: s3-web-app
+        image: image-registry.openshift-image-registry.svc:5000/object-storage-lab/s3-web-app:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: my-app-bucket
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: my-app-bucket
+              key: AWS_SECRET_ACCESS_KEY
+        - name: BUCKET_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: my-app-bucket
+              key: BUCKET_NAME
+        - name: BUCKET_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: my-app-bucket
+              key: BUCKET_HOST
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-web-app
+  namespace: object-storage-lab
+spec:
+  selector:
+    app: s3-web-app
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: s3-web-app
+  namespace: object-storage-lab
+spec:
+  to:
+    kind: Service
+    name: s3-web-app
+  port:
+    targetPort: 8080
