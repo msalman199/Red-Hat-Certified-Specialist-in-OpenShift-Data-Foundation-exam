@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-web-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secure-web-app
+  template:
+    metadata:
+      labels:
+        app: secure-web-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+        ports:
+        - containerPort: 443
+        - containerPort: 80
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /etc/nginx/ssl
+          readOnly: true
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: secure-app-tls
+      - name: nginx-config
+        configMap:
+          name: nginx-tls-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-tls-config
+  namespace: default
+data:
+  default.conf: |
+    server {
+        listen 80;
+        return 301 https://$server_name$request_uri;
+    }
+    
+    server {
+        listen 443 ssl;
+        server_name secure-app.default.svc.cluster.local;
+        
+        ssl_certificate /etc/nginx/ssl/tls.crt;
+        ssl_certificate_key /etc/nginx/ssl/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+        
+        location /health {
+            return 200 "Healthy with TLS\n";
+            add_header Content-Type text/plain;
+        }
+    }

@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encrypted-data-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: encrypted-data-app
+  template:
+    metadata:
+      labels:
+        app: encrypted-data-app
+    spec:
+      containers:
+      - name: data-container
+        image: registry.redhat.io/ubi8/ubi:latest
+        command: ["/bin/bash"]
+        args: ["-c", "while true; do echo 'Encrypted data test' >> /data/test.txt; sleep 30; done"]
+        volumeMounts:
+        - name: encrypted-storage
+          mountPath: /data
+      volumes:
+      - name: encrypted-storage
+        persistentVolumeClaim:
+          claimName: encrypted-data-pvc
