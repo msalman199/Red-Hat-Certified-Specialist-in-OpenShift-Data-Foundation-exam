@@ -1,0 +1,15 @@
+---
+# ODF Configuration Variables
+odf_namespace: openshift-storage
+odf_subscription_name: odf-operator
+odf_channel: stable-4.12
+odf_source: redhat-operators
+
+# Storage Configuration
+storage_class_name: ocs-storagecluster-ceph-rbd
+object_storage_class: ocs-storagecluster-ceph-rgw
+storage_cluster_name: ocs-storagecluster
+
+# Storage Capacity
+storage_capacity: 2Ti
+replica_count: 3

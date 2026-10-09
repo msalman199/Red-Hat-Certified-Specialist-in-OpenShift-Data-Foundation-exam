@@ -1,0 +1,538 @@
+Lab 18: Automating ODF Deployment with Ansible
+Objectives
+By the end of this lab, you will be able to:
+
+Understand the fundamentals of automating OpenShift Data Foundation (ODF) deployment using Ansible
+Create and execute Ansible playbooks to deploy and configure ODF components
+Automate the creation of Persistent Volume Claims (PVCs) and Object Bucket Claims (OBCs)
+Build a management playbook that checks ODF cluster health and reports on storage capacity
+Apply Ansible templating patterns and best practices for infrastructure as code in storage management
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of OpenShift Container Platform concepts
+Familiarity with Kubernetes storage concepts (PVs, PVCs, StorageClasses)
+Basic knowledge of Ansible automation and YAML syntax
+Understanding of OpenShift Data Foundation fundamentals
+Experience with command-line interface operations
+Access to an OpenShift cluster (4.12+) with cluster-admin privileges, or a practice/sandbox cluster where you are authorized to install operators and create storage resources
+This lab assumes a pre-configured practice environment (a personal sandbox cluster or an Al Nafi-style ready-to-use cloud machine) where Ansible, the OpenShift CLI, and network access to the cluster are already available. If you are setting up your own workstation, install the required tools with:
+
+python3 -m pip install --user ansible
+ansible-galaxy collection install kubernetes.core
+ansible-galaxy collection install community.general
+You will also need the oc CLI installed and logged in to your cluster (oc login) before running any playbook in this lab.
+
+Lab Environment Setup
+Your lab environment should include:
+
+OpenShift Container Platform cluster (4.12+)
+Ansible (2.14+) with the kubernetes.core collection installed
+Pre-installed OpenShift CLI (oc), already authenticated to the cluster
+Cluster-admin permissions, or equivalent RBAC allowing namespace, operator, and storage resource creation
+Verify your environment before starting:
+
+oc whoami
+oc get nodes
+ansible --version
+You should see your current user, a list of cluster nodes, and the installed Ansible version with no errors.
+
+Task 1: Write Ansible Playbooks to Deploy and Configure ODF
+Subtask 1.1: Set Up Ansible Environment for ODF
+Verify Ansible Installation
+ansible --version
+ansible-galaxy --version
+Install Required Ansible Collections
+ansible-galaxy collection install kubernetes.core
+ansible-galaxy collection install community.general
+Create Project Directory Structure
+mkdir -p ~/odf-ansible-lab
+cd ~/odf-ansible-lab
+mkdir -p playbooks inventory vars templates/storage roles
+Create Ansible Configuration File
+cat > ansible.cfg << 'EOF'
+[defaults]
+inventory = inventory/hosts
+host_key_checking = False
+stdout_callback = yaml
+gathering = explicit
+retry_files_enabled = False
+EOF
+Deliverable: A directory tree under ~/odf-ansible-lab containing ansible.cfg, playbooks/, inventory/, vars/, and templates/storage/. Running ansible --version and ansible-galaxy collection list should show kubernetes.core and community.general installed.
+
+Subtask 1.2: Create Inventory and Variables
+Create a Local Inventory
+Since all tasks in this lab run against the OpenShift API from the control node (not over SSH to remote hosts), we use a simple localhost inventory.
+
+cat > inventory/hosts << 'EOF'
+[local]
+localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3
+EOF
+Create Variables File for ODF Configuration
+cat > vars/odf-config.yml << 'EOF'
+---
+# ODF Configuration Variables
+odf_namespace: openshift-storage
+odf_subscription_name: odf-operator
+odf_channel: stable-4.12
+odf_source: redhat-operators
+
+# Storage Configuration
+storage_class_name: ocs-storagecluster-ceph-rbd
+object_storage_class: ocs-storagecluster-ceph-rgw
+storage_cluster_name: ocs-storagecluster
+
+# Storage Capacity
+storage_capacity: 2Ti
+replica_count: 3
+EOF
+Deliverable: inventory/hosts and vars/odf-config.yml exist and contain valid YAML. Validate with:
+
+ansible-inventory -i inventory/hosts --list
+python3 -c "import yaml; yaml.safe_load(open('vars/odf-config.yml'))" && echo "YAML OK"
+Expected result: the inventory command prints a JSON structure containing localhost, and YAML OK is printed with no parsing errors.
+
+Subtask 1.3: Create the ODF Deployment Playbook
+Create the main playbook that installs the ODF operator subscription and creates a StorageCluster. This mirrors the standard operator-based installation flow used in production ODF deployments.
+
+cat > playbooks/deploy-odf.yml << 'EOF'
+---
+- name: Deploy OpenShift Data Foundation
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/odf-config.yml
+
+  tasks:
+    - name: Create ODF namespace
+      kubernetes.core.k8s:
+        name: "{{ odf_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+        definition:
+          metadata:
+            labels:
+              openshift.io/cluster-monitoring: "true"
+
+    - name: Create OperatorGroup for ODF
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: openshift-storage-operatorgroup
+            namespace: "{{ odf_namespace }}"
+          spec:
+            targetNamespaces:
+              - "{{ odf_namespace }}"
+
+    - name: Create ODF Subscription
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: "{{ odf_subscription_name }}"
+            namespace: "{{ odf_namespace }}"
+          spec:
+            channel: "{{ odf_channel }}"
+            name: odf-operator
+            source: "{{ odf_source }}"
+            sourceNamespace: openshift-marketplace
+            installPlanApproval: Automatic
+
+    - name: Wait for ODF operator deployment to exist and become available
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: ocs-operator
+        namespace: "{{ odf_namespace }}"
+      register: ocs_operator_deployment
+      until: ocs_operator_deployment.resources | length > 0
+      retries: 30
+      delay: 20
+
+    - name: Create StorageCluster
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: ocs.openshift.io/v1
+          kind: StorageCluster
+          metadata:
+            name: "{{ storage_cluster_name }}"
+            namespace: "{{ odf_namespace }}"
+          spec:
+            manageNodes: false
+            monDataDirHostPath: /var/lib/rook
+            storageDeviceSets:
+              - name: ocs-deviceset
+                count: "{{ replica_count }}"
+                dataPVCTemplate:
+                  spec:
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: "{{ storage_capacity }}"
+                    storageClassName: gp3-csi
+                    volumeMode: Block
+                placement: {}
+                portable: true
+                replica: 1
+                resources: {}
+
+    - name: Wait for StorageCluster to report Ready phase
+      kubernetes.core.k8s_info:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ storage_cluster_name }}"
+        namespace: "{{ odf_namespace }}"
+      register: storage_cluster_check
+      until: >
+        storage_cluster_check.resources | length > 0 and
+        (storage_cluster_check.resources[0].status.phase | default('')) == 'Ready'
+      retries: 40
+      delay: 30
+EOF
+Deliverable: playbooks/deploy-odf.yml is syntactically valid and complete. Validate the YAML and Ansible syntax without touching a live cluster:
+
+ansible-playbook playbooks/deploy-odf.yml --syntax-check
+Expected result: playbook: playbooks/deploy-odf.yml is printed with no errors.
+
+If you have access to a real cluster and are authorized to install operators, run it with:
+
+ansible-playbook playbooks/deploy-odf.yml -v
+Expect the play to complete with failed=0. The StorageCluster wait step may legitimately take 10-20 minutes on real hardware; in a constrained lab environment you may stop after the subscription is created and proceed to the next tasks, since Task 2 and Task 3 do not require a fully reconciled StorageCluster.
+
+Subtask 1.4: Validate the Deployment
+cat > playbooks/validate-odf.yml << 'EOF'
+---
+- name: Validate ODF Deployment
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/odf-config.yml
+
+  tasks:
+    - name: List deployments in the ODF namespace
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ odf_namespace }}"
+      register: odf_deployments
+
+    - name: Display deployment availability
+      debug:
+        msg: "Deployment {{ item.metadata.name }} available replicas: {{ item.status.availableReplicas | default(0) }}"
+      loop: "{{ odf_deployments.resources }}"
+
+    - name: Check StorageCluster status
+      kubernetes.core.k8s_info:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ storage_cluster_name }}"
+        namespace: "{{ odf_namespace }}"
+      register: storage_cluster_status
+
+    - name: Display StorageCluster phase
+      debug:
+        msg: "StorageCluster phase: {{ storage_cluster_status.resources[0].status.phase }}"
+      when: storage_cluster_status.resources | length > 0
+
+    - name: Check available StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: storage_classes
+
+    - name: Display ODF-related StorageClasses
+      debug:
+        msg: "Found StorageClass: {{ item.metadata.name }}"
+      loop: "{{ storage_classes.resources }}"
+      when: "'ocs' in item.metadata.name"
+EOF
+ansible-playbook playbooks/validate-odf.yml --syntax-check
+Deliverable: playbooks/validate-odf.yml passes --syntax-check. If run against a live cluster with ansible-playbook playbooks/validate-odf.yml -v, expect debug output listing each deployment's available replica count, the StorageCluster phase, and any StorageClass whose name contains ocs.
+
+Task 2: Automate PVC and OBC Creation
+Subtask 2.1: Create a PVC Template and PVC Automation Playbook
+Ansible's kubernetes.core.k8s module accepts resource definitions either as inline YAML (under definition:) or rendered from a Jinja2 template file using the template module combined with k8s. Both are valid patterns in production. In this subtask you will build the reusable template first, then see it actually consumed by the playbook using the template lookup, so the connection between the two is explicit.
+
+Create the PVC Template
+mkdir -p templates/storage
+cat > templates/storage/pvc-template.yml.j2 << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: "{{ item.name }}"
+  namespace: "{{ item.namespace }}"
+  labels:
+    app: "{{ item.app_label }}"
+    created-by: ansible
+spec:
+  accessModes:
+    - "{{ item.access_mode }}"
+  resources:
+    requests:
+      storage: "{{ item.size }}"
+  storageClassName: "{{ item.storage_class }}"
+EOF
+This template demonstrates Jinja2 templating for Kubernetes manifests: it is rendered per loop item using the template lookup and passed to kubernetes.core.k8s via the definition parameter, so the same file drives every PVC in the list below.
+
+Create the PVC Automation Playbook
+cat > playbooks/create-pvcs.yml << 'EOF'
+---
+- name: Automate PVC Creation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pvcs_to_create:
+      - name: app-data-pvc
+        namespace: default
+        size: 10Gi
+        storage_class: ocs-storagecluster-ceph-rbd
+        access_mode: ReadWriteOnce
+        app_label: web-app
+      - name: database-pvc
+        namespace: default
+        size: 50Gi
+        storage_class: ocs-storagecluster-ceph-rbd
+        access_mode: ReadWriteOnce
+        app_label: database
+      - name: shared-storage-pvc
+        namespace: default
+        size: 100Gi
+        storage_class: ocs-storagecluster-cephfs
+        access_mode: ReadWriteMany
+        app_label: shared-app
+
+  tasks:
+    - name: Create namespaces if they do not exist
+      kubernetes.core.k8s:
+        name: "{{ item.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Create PVCs by rendering the pvc-template
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', '../templates/storage/pvc-template.yml.j2') }}"
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for PVCs to be bound
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      register: pvc_status
+      until: >
+        pvc_status.resources | length > 0 and
+        pvc_status.resources[0].status.phase == 'Bound'
+      retries: 15
+      delay: 10
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show PVC status
+      debug:
+        msg: "PVC {{ item.item.name }} phase: {{ item.resources[0].status.phase | default('Unknown') }}"
+      loop: "{{ pvc_status.results }}"
+      when: item.resources | length > 0
+EOF
+Deliverable: templates/storage/pvc-template.yml.j2 exists and is referenced by playbooks/create-pvcs.yml through lookup('template', ...). Validate:
+
+ansible-playbook playbooks/create-pvcs.yml --syntax-check
+Expected result: syntax check passes. If run against a live cluster (ansible-playbook playbooks/create-pvcs.yml -v), expect three PVCs created in the default namespace, and debug output showing each one's phase as Bound (assuming the referenced StorageClasses exist and can satisfy the request).
+
+Subtask 2.2: Create OBC Automation Playbook
+Object Bucket Claims (OBCs) provision S3-compatible buckets backed by the ODF RGW (Ceph Object Gateway). This playbook follows the same inline-definition pattern used in Task 1 for clarity, since OBC specs are short and do not benefit as much from a separate template.
+
+cat > playbooks/create-obcs.yml << 'EOF'
+---
+- name: Automate OBC Creation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    obcs_to_create:
+      - name: app-backup-obc
+        namespace: default
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: backup-service
+      - name: media-storage-obc
+        namespace: default
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: media-app
+      - name: log-archive-obc
+        namespace: logging
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: log-archiver
+
+  tasks:
+    - name: Create namespaces if they do not exist
+      kubernetes.core.k8s:
+        name: "{{ item.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Create OBCs
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: objectbucket.io/v1alpha1
+          kind: ObjectBucketClaim
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ item.namespace }}"
+            labels:
+              app: "{{ item.app_label }}"
+              created-by: ansible
+          spec:
+            generateBucketName: "{{ item.name }}"
+            storageClassName: "{{ item.storage_class }}"
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for OBCs to be bound
+      kubernetes.core.k8s_info:
+        api_version: objectbucket.io/v1alpha1
+        kind: ObjectBucketClaim
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      register: obc_status
+      until: >
+        obc_status.resources | length > 0 and
+        obc_status.resources[0].status.phase == 'Bound'
+      retries: 15
+      delay: 10
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display OBC bound status
+      debug:
+        msg: "OBC {{ item.item.name }} phase: {{ item.resources[0].status.phase | default('Unknown') }} in namespace {{ item.item.namespace }}"
+      loop: "{{ obc_status.results }}"
+      when: item.resources | length > 0
+EOF
+Deliverable: playbooks/create-obcs.yml passes --syntax-check:
+
+ansible-playbook playbooks/create-obcs.yml --syntax-check
+If run against a live cluster, expect three OBCs created (two in default, one in logging), each reaching Bound phase, with a generated Secret and ConfigMap of the same name as each OBC created automatically by the ODF bucket provisioner. Verify with:
+
+oc get obc --all-namespaces
+oc get secret app-backup-obc -n default -o jsonpath='{.data.AWS_ACCESS_KEY_ID}'
+Task 3: Build a Comprehensive ODF Management Playbook
+Subtask 3.1: Define Management Variables
+cat > vars/manage-config.yml << 'EOF'
+---
+# Thresholds used for capacity reporting
+storage_usage_warning_percent: 75
+storage_usage_critical_percent: 90
+EOF
+Deliverable: vars/manage-config.yml created and valid YAML.
+
+Subtask 3.2: Create the Health-Check and Capacity-Reporting Playbook
+This playbook queries the live StorageCluster and CephCluster status fields that ODF actually populates, and reports on operator pod health, StorageCluster phase, and Ceph cluster health state.
+
+cat > playbooks/manage-odf.yml << 'EOF'
+---
+- name: Comprehensive ODF Management
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/odf-config.yml
+    - ../vars/manage-config.yml
+
+  tasks:
+    - name: Check ODF cluster health via StorageCluster status
+      kubernetes.core.k8s_info:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ storage_cluster_name }}"
+        namespace: "{{ odf_namespace }}"
+      register: storage_cluster_health
+
+    - name: Report StorageCluster phase
+      debug:
+        msg: "StorageCluster {{ storage_cluster_name }} phase: {{ storage_cluster_health.resources[0].status.phase | default('Unknown') }}"
+      when: storage_cluster_health.resources | length > 0
+
+    - name: Fail fast if StorageCluster is not found
+      debug:
+        msg: "WARNING: StorageCluster {{ storage_cluster_name }} not found in namespace {{ odf_namespace }}. Skipping remaining checks."
+      when: storage_cluster_health.resources | length == 0
+
+    - name: Check underlying CephCluster health
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_cluster_health
+      when: storage_cluster_health.resources | length > 0
+
+    - name: Report CephCluster health state
+      debug:
+        msg: "CephCluster {{ item.metadata.name }} health: {{ item.status.ceph.health | default('Unknown') }}"
+      loop: "{{ ceph_cluster_health.resources }}"
+      when:
+        - storage_cluster_health.resources | length > 0
+        - ceph_cluster_health.resources is defined
+
+    - name: List pods in the ODF namespace
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+      register: odf_pods
+
+    - name: Report any pods not in Running or Succeeded phase
+      debug:
+        msg: "Pod {{ item.metadata.name }} is in phase {{ item.status.phase }}"
+      loop: "{{ odf_pods.resources }}"
+      when: item.status.phase not in ['Running', 'Succeeded']
+
+    - name: Count total pods versus running pods
+      debug:
+        msg: "ODF namespace has {{ odf_pods.resources | length }} pods total, {{ odf_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length }} in Running phase"
+EOF
+Deliverable: playbooks/manage-odf.yml is complete and passes:
+
+ansible-playbook playbooks/manage-odf.yml --syntax-check
+If run against a live cluster (ansible-playbook playbooks/manage-odf.yml -v), expect debug output showing the StorageCluster phase (typically Ready), the CephCluster health string (typically HEALTH_OK), and a final pod count summary such as ODF namespace has 24 pods total, 24 in Running phase.
+
+Subtask 3.3: Verify All Playbooks Together
+Run a syntax check across every playbook created in this lab as a final integration check:
+
+for pb in playbooks/*.yml; do
+  echo "Checking $pb"
+  ansible-playbook "$pb" --syntax-check
+done
+Deliverable: All five playbooks (deploy-odf.yml, validate-odf.yml, create-pvcs.yml, create-obcs.yml, manage-odf.yml) print playbook: <path> with no syntax errors.
+
+Expected Outcomes
+A working Ansible project under ~/odf-ansible-lab with five syntactically valid, logically complete playbooks covering ODF deployment, PVC/OBC provisioning, and cluster health reporting
+A demonstrated, working example of Jinja2 template usage (pvc-template.yml.j2) consumed directly by a playbook via the template lookup
+Practical experience reading real ODF/Ceph status fields (StorageCluster.status.phase, CephCluster.status.ceph.health) rather than invented or assumed field names
+Troubleshooting
+Symptom: kubernetes.core.k8s tasks fail with Couldn't find 'name' in the definition or similar module errors. Diagnostic hint: Check indentation and confirm every definition: block has apiVersion, kind, and metadata.name set; YAML indentation errors are the most common cause of this failure.
+
+Symptom: k8s_info wait loops for PVCs or OBCs never reach Bound and eventually exceed retries. Diagnostic hint: Run oc describe pvc <name> -n <namespace> or oc describe obc <name> -n <namespace> to see provisioning events; this usually indicates the referenced StorageClass does not exist yet or the ODF StorageCluster has not finished reconciling.
+
+Conclusion
+In this lab you built a working Ansible automation project for OpenShift Data Foundation, covering operator-based ODF deployment, templated PVC provisioning, inline OBC creation, and a health/capacity reporting playbook that reads real StorageCluster and CephCluster status fields. Along the way you practiced two complementary Ansible patterns for generating Kubernetes manifests, the template lookup for reusable, parameterized definitions and inline definition blocks for simpler one-off resources, and you learned to validate playbooks with --syntax-check before ever touching a live cluster. These playbooks are designed to be idempotent, so re-running them against an already-configured cluster is safe and is the basis for wiring them into a CI/CD pipeline (for example, a pipeline stage that runs ansible-playbook playbooks/validate-odf.yml after every cluster change, or a scheduled job that runs manage-odf.yml and forwards its debug output to a monitoring system). For further learning, review the kubernetes.core collection documentation, the Red Hat OpenShift Data Foundation documentation for the StorageCluster and CephCluster custom resource specs, and Ansible's own documentation on idempotency and error handling in production automation.

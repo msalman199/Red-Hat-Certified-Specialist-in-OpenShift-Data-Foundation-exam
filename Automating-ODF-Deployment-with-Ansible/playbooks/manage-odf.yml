@@ -1,0 +1,59 @@
+---
+- name: Comprehensive ODF Management
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/odf-config.yml
+    - ../vars/manage-config.yml
+
+  tasks:
+    - name: Check ODF cluster health via StorageCluster status
+      kubernetes.core.k8s_info:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ storage_cluster_name }}"
+        namespace: "{{ odf_namespace }}"
+      register: storage_cluster_health
+
+    - name: Report StorageCluster phase
+      debug:
+        msg: "StorageCluster {{ storage_cluster_name }} phase: {{ storage_cluster_health.resources[0].status.phase | default('Unknown') }}"
+      when: storage_cluster_health.resources | length > 0
+
+    - name: Fail fast if StorageCluster is not found
+      debug:
+        msg: "WARNING: StorageCluster {{ storage_cluster_name }} not found in namespace {{ odf_namespace }}. Skipping remaining checks."
+      when: storage_cluster_health.resources | length == 0
+
+    - name: Check underlying CephCluster health
+      kubernetes.core.k8s_info:
+        api_version: ceph.rook.io/v1
+        kind: CephCluster
+        namespace: "{{ odf_namespace }}"
+      register: ceph_cluster_health
+      when: storage_cluster_health.resources | length > 0
+
+    - name: Report CephCluster health state
+      debug:
+        msg: "CephCluster {{ item.metadata.name }} health: {{ item.status.ceph.health | default('Unknown') }}"
+      loop: "{{ ceph_cluster_health.resources }}"
+      when:
+        - storage_cluster_health.resources | length > 0
+        - ceph_cluster_health.resources is defined
+
+    - name: List pods in the ODF namespace
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+      register: odf_pods
+
+    - name: Report any pods not in Running or Succeeded phase
+      debug:
+        msg: "Pod {{ item.metadata.name }} is in phase {{ item.status.phase }}"
+      loop: "{{ odf_pods.resources }}"
+      when: item.status.phase not in ['Running', 'Succeeded']
+
+    - name: Count total pods versus running pods
+      debug:
+        msg: "ODF namespace has {{ odf_pods.resources | length }} pods total, {{ odf_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length }} in Running phase"

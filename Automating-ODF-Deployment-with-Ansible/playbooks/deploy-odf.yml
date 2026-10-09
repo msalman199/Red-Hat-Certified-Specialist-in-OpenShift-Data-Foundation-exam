@@ -1,0 +1,100 @@
+---
+- name: Deploy OpenShift Data Foundation
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/odf-config.yml
+
+  tasks:
+    - name: Create ODF namespace
+      kubernetes.core.k8s:
+        name: "{{ odf_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+        definition:
+          metadata:
+            labels:
+              openshift.io/cluster-monitoring: "true"
+
+    - name: Create OperatorGroup for ODF
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: openshift-storage-operatorgroup
+            namespace: "{{ odf_namespace }}"
+          spec:
+            targetNamespaces:
+              - "{{ odf_namespace }}"
+
+    - name: Create ODF Subscription
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: "{{ odf_subscription_name }}"
+            namespace: "{{ odf_namespace }}"
+          spec:
+            channel: "{{ odf_channel }}"
+            name: odf-operator
+            source: "{{ odf_source }}"
+            sourceNamespace: openshift-marketplace
+            installPlanApproval: Automatic
+
+    - name: Wait for ODF operator deployment to exist and become available
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: ocs-operator
+        namespace: "{{ odf_namespace }}"
+      register: ocs_operator_deployment
+      until: ocs_operator_deployment.resources | length > 0
+      retries: 30
+      delay: 20
+
+    - name: Create StorageCluster
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: ocs.openshift.io/v1
+          kind: StorageCluster
+          metadata:
+            name: "{{ storage_cluster_name }}"
+            namespace: "{{ odf_namespace }}"
+          spec:
+            manageNodes: false
+            monDataDirHostPath: /var/lib/rook
+            storageDeviceSets:
+              - name: ocs-deviceset
+                count: "{{ replica_count }}"
+                dataPVCTemplate:
+                  spec:
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: "{{ storage_capacity }}"
+                    storageClassName: gp3-csi
+                    volumeMode: Block
+                placement: {}
+                portable: true
+                replica: 1
+                resources: {}
+
+    - name: Wait for StorageCluster to report Ready phase
+      kubernetes.core.k8s_info:
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ storage_cluster_name }}"
+        namespace: "{{ odf_namespace }}"
+      register: storage_cluster_check
+      until: >
+        storage_cluster_check.resources | length > 0 and
+        (storage_cluster_check.resources[0].status.phase | default('')) == 'Ready'
+      retries: 40
+      delay: 30

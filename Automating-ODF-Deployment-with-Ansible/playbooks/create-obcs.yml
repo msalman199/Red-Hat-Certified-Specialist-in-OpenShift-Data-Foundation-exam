@@ -1,0 +1,70 @@
+---
+- name: Automate OBC Creation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    obcs_to_create:
+      - name: app-backup-obc
+        namespace: default
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: backup-service
+      - name: media-storage-obc
+        namespace: default
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: media-app
+      - name: log-archive-obc
+        namespace: logging
+        storage_class: ocs-storagecluster-ceph-rgw
+        app_label: log-archiver
+
+  tasks:
+    - name: Create namespaces if they do not exist
+      kubernetes.core.k8s:
+        name: "{{ item.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Create OBCs
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: objectbucket.io/v1alpha1
+          kind: ObjectBucketClaim
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ item.namespace }}"
+            labels:
+              app: "{{ item.app_label }}"
+              created-by: ansible
+          spec:
+            generateBucketName: "{{ item.name }}"
+            storageClassName: "{{ item.storage_class }}"
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for OBCs to be bound
+      kubernetes.core.k8s_info:
+        api_version: objectbucket.io/v1alpha1
+        kind: ObjectBucketClaim
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      register: obc_status
+      until: >
+        obc_status.resources | length > 0 and
+        obc_status.resources[0].status.phase == 'Bound'
+      retries: 15
+      delay: 10
+      loop: "{{ obcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display OBC bound status
+      debug:
+        msg: "OBC {{ item.item.name }} phase: {{ item.resources[0].status.phase | default('Unknown') }} in namespace {{ item.item.namespace }}"
+      loop: "{{ obc_status.results }}"
+      when: item.resources | length > 0

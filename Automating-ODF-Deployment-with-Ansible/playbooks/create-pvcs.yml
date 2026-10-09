@@ -1,0 +1,65 @@
+---
+- name: Automate PVC Creation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pvcs_to_create:
+      - name: app-data-pvc
+        namespace: default
+        size: 10Gi
+        storage_class: ocs-storagecluster-ceph-rbd
+        access_mode: ReadWriteOnce
+        app_label: web-app
+      - name: database-pvc
+        namespace: default
+        size: 50Gi
+        storage_class: ocs-storagecluster-ceph-rbd
+        access_mode: ReadWriteOnce
+        app_label: database
+      - name: shared-storage-pvc
+        namespace: default
+        size: 100Gi
+        storage_class: ocs-storagecluster-cephfs
+        access_mode: ReadWriteMany
+        app_label: shared-app
+
+  tasks:
+    - name: Create namespaces if they do not exist
+      kubernetes.core.k8s:
+        name: "{{ item.namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.namespace }}"
+
+    - name: Create PVCs by rendering the pvc-template
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', '../templates/storage/pvc-template.yml.j2') }}"
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for PVCs to be bound
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      register: pvc_status
+      until: >
+        pvc_status.resources | length > 0 and
+        pvc_status.resources[0].status.phase == 'Bound'
+      retries: 15
+      delay: 10
+      loop: "{{ pvcs_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show PVC status
+      debug:
+        msg: "PVC {{ item.item.name }} phase: {{ item.resources[0].status.phase | default('Unknown') }}"
+      loop: "{{ pvc_status.results }}"
+      when: item.resources | length > 0
