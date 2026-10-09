@@ -1,0 +1,49 @@
+---
+- name: Configure ODF Volume Snapshot Backups
+  hosts: openshift
+  gather_facts: false
+  vars_files:
+    - ../vars/storage-config.yml
+
+  tasks:
+    - name: Create VolumeSnapshotClass for RBD
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: snapshot.storage.k8s.io/v1
+          kind: VolumeSnapshotClass
+          metadata:
+            name: ocs-storagecluster-rbdplugin-snapclass
+          driver: openshift-storage.rbd.csi.ceph.com
+          deletionPolicy: Delete
+        state: present
+
+    - name: Create a VolumeSnapshot for each application PVC
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: snapshot.storage.k8s.io/v1
+          kind: VolumeSnapshot
+          metadata:
+            name: "{{ item.name }}-snapshot-manual"
+            namespace: "{{ item.namespace }}"
+          spec:
+            volumeSnapshotClassName: ocs-storagecluster-rbdplugin-snapclass
+            source:
+              persistentVolumeClaimName: "{{ item.name }}-pvc"
+        state: present
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for snapshots to become ready
+      kubernetes.core.k8s_info:
+        api_version: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        name: "{{ item.name }}-snapshot-manual"
+        namespace: "{{ item.namespace }}"
+      register: snap_status
+      until: snap_status.resources[0].status.readyToUse | default(false)
+      retries: 12
+      delay: 10
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"

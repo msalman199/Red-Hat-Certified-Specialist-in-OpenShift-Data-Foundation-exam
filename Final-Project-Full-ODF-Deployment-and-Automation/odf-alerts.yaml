@@ -1,0 +1,38 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: odf-storage-alerts
+  namespace: openshift-storage
+  labels:
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: odf-storage.rules
+    rules:
+    - alert: CephClusterErrorState
+      expr: ceph_health_status == 2
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ceph cluster is in error state"
+        description: "Ceph cluster has reported HEALTH_ERR for more than 5 minutes"
+
+    - alert: CephOSDDown
+      expr: ceph_osd_up == 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "A Ceph OSD is down"
+        description: "OSD {{ $labels.ceph_daemon }} has been down for more than 5 minutes"
+
+    - alert: PersistentVolumeUsageHigh
+      expr: (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Persistent Volume usage is high"
+        description: "PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }} is {{ $value }}% full"

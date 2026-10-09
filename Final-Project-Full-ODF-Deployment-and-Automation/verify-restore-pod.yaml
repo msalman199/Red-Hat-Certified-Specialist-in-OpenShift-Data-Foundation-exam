@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restore-verify
+  namespace: odf-demo
+spec:
+  containers:
+  - name: verify
+    image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+    command: ["/bin/sh", "-c", "ls -la /data && echo restore-check-ok && sleep 60"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: database-app-pvc-restored
+  restartPolicy: Never

@@ -1,0 +1,16 @@
+---
+odf_namespace: openshift-storage
+
+applications:
+  - name: database-app
+    namespace: odf-demo
+    storage_class: ocs-storagecluster-ceph-rbd
+    size: 10Gi
+    access_mode: ReadWriteOnce
+  - name: shared-storage
+    namespace: odf-demo
+    storage_class: ocs-storagecluster-cephfs
+    size: 10Gi
+    access_mode: ReadWriteMany
+
+backup_schedule: "0 2 * * *"

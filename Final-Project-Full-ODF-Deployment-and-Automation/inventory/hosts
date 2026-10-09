@@ -1,0 +1,5 @@
+[openshift]
+localhost ansible_connection=local
+
+[openshift:vars]
+ansible_python_interpreter=/usr/bin/python3

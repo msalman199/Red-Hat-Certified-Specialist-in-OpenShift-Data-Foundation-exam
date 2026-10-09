@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-app-pvc-restored
+  namespace: odf-demo
+spec:
+  storageClassName: ocs-storagecluster-ceph-rbd
+  dataSource:
+    name: database-app-snapshot-manual
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

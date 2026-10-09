@@ -1,0 +1,511 @@
+Lab 20: Final Project - Production ODF Deployment with Multi-Zone Resilience, Automated Backups, and Monitoring
+Objectives
+By the end of this lab, students will be able to:
+
+Deploy an OpenShift Data Foundation (ODF) StorageCluster configured for multi-zone resilience and verify that storage pods are actually distributed across availability zones
+Automate storage provisioning and scheduled volume snapshot backups using Ansible playbooks against an OpenShift cluster
+Configure custom Prometheus alerting rules for ODF/Ceph health, capacity, and OSD status
+Validate high availability by simulating node/zone disruption and confirming Ceph cluster health is maintained
+Perform a disaster recovery drill using volume snapshots, including restore verification and RPO/RTO measurement
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Kubernetes and OpenShift concepts (Pods, Nodes, Namespaces)
+Familiarity with storage concepts (PVs, PVCs, StorageClasses, VolumeSnapshots)
+Experience reading and writing YAML configuration files
+Basic knowledge of Ansible playbook structure
+Access to an OpenShift cluster (version 4.12+) with at least 3 worker nodes spread across 3 availability zones, and cluster-admin privileges
+Required Tools
+Install the following on your lab workstation before starting (adjust package manager as needed for your OS):
+
+# Verify the OpenShift CLI is installed
+oc version --client
+
+# Install Ansible and the required collections
+pip install --user ansible
+ansible-galaxy collection install kubernetes.core
+ansible-galaxy collection install community.general
+
+# Verify jq is available for JSON parsing
+jq --version
+Log in to your cluster before proceeding:
+
+oc login --token=<your-token> --server=<your-cluster-api-url>
+oc whoami
+Task 1: Deploy ODF with Verified Multi-Zone Resilience
+Step 1.1: Verify Cluster Zone Topology
+Confirm your worker nodes are spread across at least three zones before deploying storage.
+
+# Check cluster nodes and their zone labels
+oc get nodes -L topology.kubernetes.io/zone -L node-role.kubernetes.io/worker
+
+# Count distinct zones among worker nodes
+oc get nodes -l node-role.kubernetes.io/worker -o jsonpath='{.items[*].metadata.labels.topology\.kubernetes\.io/zone}' | tr ' ' '\n' | sort -u
+Expected output should list at least three distinct zone names (for example us-east-1a, us-east-1b, us-east-1c). If fewer than three zones are present, note this limitation and continue with the zones available; the deployment steps still apply.
+
+Step 1.2: Install the ODF Operator
+# Create the storage namespace
+oc create namespace openshift-storage
+
+# Label the namespace for cluster monitoring integration
+oc label namespace openshift-storage openshift.io/cluster-monitoring=true
+Create the operator subscription:
+
+cat << 'EOF' > odf-operator-subscription.yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-storage-operatorgroup
+  namespace: openshift-storage
+spec:
+  targetNamespaces:
+  - openshift-storage
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: odf-operator
+  namespace: openshift-storage
+spec:
+  channel: stable-4.14
+  installPlanApproval: Automatic
+  name: odf-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+oc apply -f odf-operator-subscription.yaml
+Wait for the operator to become ready:
+
+oc get csv -n openshift-storage -w
+Deliverable: run oc get csv -n openshift-storage. The ODF ClusterServiceVersion should show PHASE: Succeeded before proceeding.
+
+Step 1.3: Label Nodes and Deploy a Multi-Zone StorageCluster
+# Get worker nodes and label them for storage placement
+WORKER_NODES=$(oc get nodes --no-headers -l node-role.kubernetes.io/worker | awk '{print $1}')
+
+for node in $WORKER_NODES; do
+  oc label node "$node" cluster.ocs.openshift.io/openshift-storage="" --overwrite
+done
+Create the StorageCluster with pod anti-affinity across zones:
+
+cat << 'EOF' > storage-cluster-multizone.yaml
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  manageNodes: false
+  resources:
+    mds:
+      limits:
+        cpu: "3"
+        memory: "8Gi"
+      requests:
+        cpu: "1"
+        memory: "8Gi"
+    mon:
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+  storageDeviceSets:
+  - name: ocs-deviceset
+    count: 1
+    replica: 3
+    portable: true
+    dataPVCTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: "100Gi"
+        storageClassName: gp3-csi
+        volumeMode: Block
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: cluster.ocs.openshift.io/openshift-storage
+              operator: Exists
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - rook-ceph-osd
+            topologyKey: topology.kubernetes.io/zone
+    resources:
+      limits:
+        cpu: "2"
+        memory: "5Gi"
+      requests:
+        cpu: "1"
+        memory: "5Gi"
+EOF
+oc apply -f storage-cluster-multizone.yaml
+Monitor rollout:
+
+oc get pods -n openshift-storage -w
+Step 1.4: Verify Zone Distribution
+This is the key resilience check: confirm that OSD pods actually landed on nodes in different zones, not just that anti-affinity rules were configured.
+
+# List rook-ceph-osd pods with the node they landed on
+oc get pods -n openshift-storage -l app=rook-ceph-osd \
+  -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase
+
+# Cross-reference each node with its zone label
+for pod in $(oc get pods -n openshift-storage -l app=rook-ceph-osd -o jsonpath='{.items[*].metadata.name}'); do
+  node=$(oc get pod "$pod" -n openshift-storage -o jsonpath='{.spec.nodeName}')
+  zone=$(oc get node "$node" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}')
+  echo "$pod  node=$node  zone=$zone"
+done
+Expected output (values will vary by cluster):
+
+rook-ceph-osd-0-abcde  node=worker-0  zone=us-east-1a
+rook-ceph-osd-1-fghij  node=worker-1  zone=us-east-1b
+rook-ceph-osd-2-klmno  node=worker-2  zone=us-east-1c
+Deliverable: capture this output and confirm at least two distinct zones appear across the OSD pods (three if your cluster has three zones available). If all OSD pods landed on the same zone, the anti-affinity rule is not being honored and the StorageCluster placement spec must be reviewed.
+
+Finally, verify Ceph reports a healthy cluster:
+
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph status
+Expected result: health: HEALTH_OK (or HEALTH_WARN during initial sync, which should clear within a few minutes).
+
+Task 2: Automate Storage Provisioning and Snapshot Backups with Ansible
+Step 2.1: Set Up the Ansible Project
+mkdir -p ~/odf-automation/{playbooks,inventory,vars}
+cd ~/odf-automation
+
+cat << 'EOF' > ansible.cfg
+[defaults]
+inventory = inventory/hosts
+host_key_checking = False
+stdout_callback = yaml
+EOF
+
+cat << 'EOF' > inventory/hosts
+[openshift]
+localhost ansible_connection=local
+
+[openshift:vars]
+ansible_python_interpreter=/usr/bin/python3
+EOF
+Step 2.2: Define Storage Variables
+cat << 'EOF' > vars/storage-config.yml
+---
+odf_namespace: openshift-storage
+
+applications:
+  - name: database-app
+    namespace: odf-demo
+    storage_class: ocs-storagecluster-ceph-rbd
+    size: 10Gi
+    access_mode: ReadWriteOnce
+  - name: shared-storage
+    namespace: odf-demo
+    storage_class: ocs-storagecluster-cephfs
+    size: 10Gi
+    access_mode: ReadWriteMany
+
+backup_schedule: "0 2 * * *"
+EOF
+Step 2.3: Create the Storage Provisioning Playbook
+cat << 'EOF' > playbooks/provision-storage.yml
+---
+- name: Provision ODF Storage Resources
+  hosts: openshift
+  gather_facts: false
+  vars_files:
+    - ../vars/storage-config.yml
+
+  tasks:
+    - name: Create application namespace
+      kubernetes.core.k8s:
+        name: odf-demo
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create PVCs for applications
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item.name }}-pvc"
+            namespace: "{{ item.namespace }}"
+          spec:
+            accessModes:
+              - "{{ item.access_mode }}"
+            resources:
+              requests:
+                storage: "{{ item.size }}"
+            storageClassName: "{{ item.storage_class }}"
+        state: present
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Check PVC status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ item.name }}-pvc"
+        namespace: "{{ item.namespace }}"
+      register: pvc_status
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display PVC status
+      debug:
+        msg: "PVC {{ item.item.name }}-pvc is {{ item.resources[0].status.phase }}"
+      loop: "{{ pvc_status.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+EOF
+Run it:
+
+cd ~/odf-automation
+ansible-playbook playbooks/provision-storage.yml -v
+oc get pvc -n odf-demo
+Deliverable: oc get pvc -n odf-demo shows both database-app-pvc and shared-storage-pvc with STATUS: Bound.
+
+Step 2.4: Create the Snapshot Backup Playbook
+cat << 'EOF' > playbooks/backup-storage.yml
+---
+- name: Configure ODF Volume Snapshot Backups
+  hosts: openshift
+  gather_facts: false
+  vars_files:
+    - ../vars/storage-config.yml
+
+  tasks:
+    - name: Create VolumeSnapshotClass for RBD
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: snapshot.storage.k8s.io/v1
+          kind: VolumeSnapshotClass
+          metadata:
+            name: ocs-storagecluster-rbdplugin-snapclass
+          driver: openshift-storage.rbd.csi.ceph.com
+          deletionPolicy: Delete
+        state: present
+
+    - name: Create a VolumeSnapshot for each application PVC
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: snapshot.storage.k8s.io/v1
+          kind: VolumeSnapshot
+          metadata:
+            name: "{{ item.name }}-snapshot-manual"
+            namespace: "{{ item.namespace }}"
+          spec:
+            volumeSnapshotClassName: ocs-storagecluster-rbdplugin-snapclass
+            source:
+              persistentVolumeClaimName: "{{ item.name }}-pvc"
+        state: present
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for snapshots to become ready
+      kubernetes.core.k8s_info:
+        api_version: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshot
+        name: "{{ item.name }}-snapshot-manual"
+        namespace: "{{ item.namespace }}"
+      register: snap_status
+      until: snap_status.resources[0].status.readyToUse | default(false)
+      retries: 12
+      delay: 10
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+EOF
+Run it:
+
+ansible-playbook playbooks/backup-storage.yml -v
+oc get volumesnapshot -n odf-demo
+Deliverable: oc get volumesnapshot -n odf-demo shows both snapshots with READYTOUSE: true.
+
+Task 3: Configure Custom Monitoring and Alerting for ODF
+Step 3.1: Create Custom PrometheusRule for Ceph and PVC Health
+cat << 'EOF' > odf-alerts.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: odf-storage-alerts
+  namespace: openshift-storage
+  labels:
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: odf-storage.rules
+    rules:
+    - alert: CephClusterErrorState
+      expr: ceph_health_status == 2
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ceph cluster is in error state"
+        description: "Ceph cluster has reported HEALTH_ERR for more than 5 minutes"
+
+    - alert: CephOSDDown
+      expr: ceph_osd_up == 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "A Ceph OSD is down"
+        description: "OSD {{ $labels.ceph_daemon }} has been down for more than 5 minutes"
+
+    - alert: PersistentVolumeUsageHigh
+      expr: (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Persistent Volume usage is high"
+        description: "PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }} is {{ $value }}% full"
+EOF
+oc apply -f odf-alerts.yaml
+Step 3.2: Verify Alert Rules Are Loaded
+oc get prometheusrule odf-storage-alerts -n openshift-storage
+
+# Query the Prometheus API (via the route) to confirm the rules registered
+TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring)
+PROM_ROUTE=$(oc get route prometheus-k8s -n openshift-monitoring -o jsonpath='{.spec.host}')
+curl -s -k -H "Authorization: Bearer ${TOKEN}" \
+  "https://${PROM_ROUTE}/api/v1/rules" | jq '.data.groups[] | select(.name=="odf-storage.rules") | .rules[].name'
+Deliverable: the command prints "CephClusterErrorState", "CephOSDDown", and "PersistentVolumeUsageHigh", confirming Prometheus has loaded the custom rules.
+
+Task 4: Validate High Availability
+Step 4.1: Confirm Baseline Cluster Health
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph status
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph osd tree
+Expected output: health: HEALTH_OK, with all OSDs listed as up and in.
+
+Step 4.2: Simulate a Zone/Node Failure
+Cordon and drain one storage node to simulate loss of an entire zone's compute capacity:
+
+# Pick one storage node to simulate failure
+FAIL_NODE=$(oc get nodes -l cluster.ocs.openshift.io/openshift-storage -o jsonpath='{.items[0].metadata.name}')
+echo "Simulating failure on: $FAIL_NODE"
+
+oc adm cordon "$FAIL_NODE"
+oc adm drain "$FAIL_NODE" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s
+Step 4.3: Verify Ceph Remains Available During the Outage
+# Ceph should degrade gracefully but remain operational with replica=3
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph status
+Expected result: health: HEALTH_WARN (degraded redundancy is expected with one node down), but the cluster still reports it is servicing I/O and no data is unavailable. Confirm this explicitly:
+
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph status | grep -E "health:|pgs:"
+Look for the absence of unavailable or down PG states in the output; degraded PGs are expected and acceptable.
+
+Step 4.4: Restore the Node
+oc adm uncordon "$FAIL_NODE"
+
+# Wait for Ceph to recover to HEALTH_OK
+oc rsh -n openshift-storage deployment/rook-ceph-tools ceph status
+Deliverable: capture the ceph status output before the drain (HEALTH_OK), during the drain (HEALTH_WARN with no unavailable data), and after uncordon (back to HEALTH_OK). This three-state comparison is your HA validation evidence.
+
+Task 5: Disaster Recovery Drill Using Volume Snapshots
+Step 5.1: Simulate Data Loss
+Delete the original PVC-backed data by removing the database-app PVC (the snapshot created in Task 2 remains intact and independent of the source PVC's lifecycle).
+
+# Record the current PVC for reference, then delete it to simulate loss
+oc get pvc database-app-pvc -n odf-demo -o yaml > database-app-pvc-original.yaml
+oc delete pvc database-app-pvc -n odf-demo
+Step 5.2: Restore from Snapshot (RTO Measurement)
+# Record start time for RTO measurement
+START_TIME=$(date +%s)
+
+cat << 'EOF' > restore-from-snapshot.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-app-pvc-restored
+  namespace: odf-demo
+spec:
+  storageClassName: ocs-storagecluster-ceph-rbd
+  dataSource:
+    name: database-app-snapshot-manual
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+oc apply -f restore-from-snapshot.yaml
+
+# Wait for the restored PVC to bind
+oc wait --for=jsonpath='{.status.phase}'=Bound pvc/database-app-pvc-restored -n odf-demo --timeout=120s
+
+END_TIME=$(date +%s)
+echo "Restore Time Objective (RTO): $((END_TIME - START_TIME)) seconds"
+Deliverable: oc get pvc database-app-pvc-restored -n odf-demo shows STATUS: Bound, and the printed RTO value is a concrete number of seconds.
+
+Step 5.3: Verify Restored Data Integrity
+Mount the restored PVC in a temporary pod and confirm it is usable:
+
+cat << 'EOF' > verify-restore-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restore-verify
+  namespace: odf-demo
+spec:
+  containers:
+  - name: verify
+    image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+    command: ["/bin/sh", "-c", "ls -la /data && echo restore-check-ok && sleep 60"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: database-app-pvc-restored
+  restartPolicy: Never
+EOF
+oc apply -f verify-restore-pod.yaml
+oc wait --for=condition=Ready pod/restore-verify -n odf-demo --timeout=60s
+oc logs restore-verify -n odf-demo
+Expected output includes the line restore-check-ok, confirming the restored volume mounted successfully and is readable.
+
+Step 5.4: Calculate RPO and Clean Up
+The RPO for this drill equals the time elapsed between when the snapshot was taken (Task 2, Step 2.4) and when the simulated data loss occurred (Step 5.1). Since the snapshot was taken immediately before the drill, record this interval:
+
+# Compare snapshot creation time to the deletion time to document RPO
+oc get volumesnapshot database-app-snapshot-manual -n odf-demo -o jsonpath='{.metadata.creationTimestamp}'
+echo ""
+echo "RPO = time between last snapshot and simulated data loss event"
+Clean up the drill resources:
+
+oc delete pod restore-verify -n odf-demo
+oc delete pvc database-app-pvc-restored -n odf-demo
+Deliverable: a written record (a few lines is sufficient) stating the measured RTO in seconds and the RPO interval based on snapshot cadence, demonstrating that recovery objectives can be quantified for this configuration.
+
+Expected Outcomes
+A running ODF StorageCluster with OSD pods confirmed, via direct node/zone lookup, to be distributed across at least two availability zones
+Working Ansible playbooks that provision namespaced PVCs and create verified, ready-to-use volume snapshots
+Custom Prometheus alerting rules confirmed loaded via the Prometheus API, plus documented evidence that Ceph tolerates a simulated node failure and that a snapshot-based restore completes with a measured RTO
+Troubleshooting
+StorageCluster stuck in Progressing phase: Run oc describe storagecluster ocs-storagecluster -n openshift-storage and check the Conditions section; this usually indicates OSD PVCs are not binding, often because the underlying storageClassName (for example gp3-csi) does not exist in your cluster.
+VolumeSnapshot never becomes readyToUse: Check oc describe volumesnapshot <name> -n odf-demo and the CSI snapshotter controller logs with oc logs -n openshift-storage deployment/csi-snapshotter (or the equivalent snapshot-controller pod); a missing or misconfigured VolumeSnapshotClass driver name is the most common cause.
+Conclusion
+In this lab, you deployed an OpenShift Data Foundation StorageCluster and explicitly verified that its OSD pods were scheduled across distinct availability zones rather than simply trusting the affinity configuration. You then built Ansible playbooks to automate PVC provisioning and snapshot-based backups, confirmed those snapshots were usable, added custom Prometheus alerting rules for Ceph and PVC health, and validated resilience by draining a storage node and observing that Ceph continued serving data. Finally, you ran a disaster recovery drill that restored a PVC from a snapshot and measured a concrete RTO, tying the abstract concepts of high availability and disaster recovery to observable, checkable cluster behavior. With these skills, you are prepared to extend this workflow to production scenarios involving cross-cluster replication, scheduled automated backup cronjobs, and formal RPO/RTO service level objectives.

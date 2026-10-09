@@ -1,0 +1,52 @@
+---
+- name: Provision ODF Storage Resources
+  hosts: openshift
+  gather_facts: false
+  vars_files:
+    - ../vars/storage-config.yml
+
+  tasks:
+    - name: Create application namespace
+      kubernetes.core.k8s:
+        name: odf-demo
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create PVCs for applications
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item.name }}-pvc"
+            namespace: "{{ item.namespace }}"
+          spec:
+            accessModes:
+              - "{{ item.access_mode }}"
+            resources:
+              requests:
+                storage: "{{ item.size }}"
+            storageClassName: "{{ item.storage_class }}"
+        state: present
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Check PVC status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ item.name }}-pvc"
+        namespace: "{{ item.namespace }}"
+      register: pvc_status
+      loop: "{{ applications }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display PVC status
+      debug:
+        msg: "PVC {{ item.item.name }}-pvc is {{ item.resources[0].status.phase }}"
+      loop: "{{ pvc_status.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
